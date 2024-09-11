@@ -19,7 +19,7 @@ pip install diffusers[torch] transformers[sentencepiece]
 
 ## Usage
 
-We reference the [Diffuser script](https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion_sdxl.py), so all the arguments are the same, you can read (this)[https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/README_sdxl.md].
+We reference the [Diffuser script](https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion_sdxl.py), so all the arguments are the same, you can read [this](https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/README_sdxl.md).
 
 ```bash
 export DATA_DIR="./cat"
