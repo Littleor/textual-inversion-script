@@ -1,5 +1,25 @@
 # Textual Inversion Script
 
+<p align="center">
+<a href="https://github.com/Littleor/textual-inversion-script/blob/master/LICENSE" target="blank">
+<img src="https://img.shields.io/github/license/Littleor/textual-inversion-script?style=flat-square" alt="github-profile-readme-generator license" />
+</a>
+<a href="https://github.com/Littleor/textual-inversion-script/fork" target="blank">
+<img src="https://img.shields.io/github/forks/Littleor/textual-inversion-script?style=flat-square" alt="github-profile-readme-generator forks"/>
+</a>
+<a href="https://github.com/Littleor/textual-inversion-script/stargazers" target="blank">
+<img src="https://img.shields.io/github/stars/Littleor/textual-inversion-script?style=flat-square" alt="github-profile-readme-generator stars"/>
+</a>
+<a href="https://github.com/Littleor/textual-inversion-script/issues" target="blank">
+<img src="https://img.shields.io/github/issues/Littleor/textual-inversion-script?style=flat-square" alt="github-profile-readme-generator issues"/>
+</a>
+<a href="https://github.com/Littleor/textual-inversion-script/pulls" target="blank">
+<img src="https://img.shields.io/github/issues-pr/Littleor/textual-inversion-script?style=flat-square" alt="github-profile-readme-generator pull-requests"/>
+</a>
+</p>
+
+
+
 This repository contains some scripts that can be used to [Textual Inversion](https://github.com/rinongal/textual_inversion) in both Stable Diffusion 3 ([SD3](https://huggingface.co/stabilityai/stable-diffusion-3-medium)) and FLUX ([FLUX.1](https://huggingface.co/black-forest-labs/FLUX.1-dev)) models.
 
 > This script need 40G+ VRAM to run, 24G version maybe released soon.
