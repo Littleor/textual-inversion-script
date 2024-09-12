@@ -1242,32 +1242,18 @@ def main():
                 
                 # Predict the noise residual
                 if args.gradient_checkpointing:
-                    # Below will OOM
-                    # model_pred = torch.utils.checkpoint.checkpoint(transformer,
-                    #     packed_noisy_latents.to(dtype=weight_dtype),
-                    #     prompt_embeds.to(dtype=weight_dtype),
-                    #     pooled_prompt_embeds.to(dtype=weight_dtype),
-                    #     timesteps / 1000,
-                    #     latent_image_ids,
-                    #     text_ids,
-                    #     guidance,
-                    #     None,
-                    #     False,
-                    #     use_reentrant=True
-                    #     )[0]
-                    with torch.no_grad():
-                        model_pred = transformer(
-                            hidden_states=packed_noisy_latents.to(dtype=weight_dtype),
-                            # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
-                            timestep=timesteps / 1000,
-                            guidance=guidance,
-                            pooled_projections=pooled_prompt_embeds.to(dtype=weight_dtype),
-                            encoder_hidden_states=prompt_embeds.to(dtype=weight_dtype),
-                            txt_ids=text_ids,
-                            img_ids=latent_image_ids,
-                            return_dict=False
+                    model_pred = torch.utils.checkpoint.checkpoint(transformer,
+                        packed_noisy_latents.to(dtype=weight_dtype),
+                        prompt_embeds.to(dtype=weight_dtype),
+                        pooled_prompt_embeds.to(dtype=weight_dtype),
+                        timesteps / 1000,
+                        latent_image_ids,
+                        text_ids,
+                        guidance,
+                        None,
+                        False,
+                        use_reentrant=True
                         )[0]
-                    model_pred.requires_grad = True
                 else:
                     model_pred = transformer(
                         hidden_states=packed_noisy_latents.to(dtype=weight_dtype),
