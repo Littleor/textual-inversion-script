@@ -15,6 +15,7 @@
 
 import argparse
 import copy
+import glob
 import logging
 import math
 import os
@@ -556,6 +557,36 @@ imagenet_style_templates_small = [
 ]
 
 
+class FLUXModel(torch.nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        
+        # Load tokenizer
+        self.tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+        self.tokenizer_2 = T5TokenizerFast.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
+        
+        # Load scheduler and models
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        )
+        self.text_encoder_2 = T5EncoderModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
+        )
+        if not args.cache_latent:
+            self.vae = AutoencoderKL.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+            )
+        else:
+            self.vae = None
+        self.transformer = FluxTransformer2DModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        )
+        pass
+        # deepspeed.zero.register_external_parameter(self, self.text_encoder.get_input_embeddings().weight)
+        # deepspeed.zero.register_external_parameter(self, self.text_encoder_2.get_input_embeddings().weight)
+
 class TextualInversionDataset(Dataset):
     def __init__(
         self,
@@ -575,6 +606,7 @@ class TextualInversionDataset(Dataset):
         args=None,
         weight_dtype=None,
         device=None,
+        image_formats=('jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp')
     ):
         self.data_root = data_root
         self.tokenizer_1 = tokenizer_1
@@ -587,8 +619,8 @@ class TextualInversionDataset(Dataset):
         self.cache_latents = cache_latents
         self.weight_dtype = weight_dtype
         self.device = device
-
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+        self.image_formats = image_formats
+        self.image_paths = [img for ext in image_formats for img in glob.glob(f"{self.data_root}/**/*.{ext}", recursive=True)]
 
         self.num_images = len(self.image_paths)
         self._length = self.num_images
@@ -624,6 +656,8 @@ class TextualInversionDataset(Dataset):
         
         cache_data = []
         for image_path in tqdm(self.image_paths, desc="Cache Latents"):
+            cache_tensor_path = image_path.replace(image_path.split('.')[-1], 'pt')
+            
             image = Image.open(image_path)
             if not image.mode == "RGB":
                 image = image.convert("RGB")
@@ -643,6 +677,11 @@ class TextualInversionDataset(Dataset):
                 "original_size": (image.height, image.width),
             }
             
+            if os.path.exists(cache_tensor_path):
+                data["latents"] = torch.load(cache_tensor_path, map_location="cpu")
+                cache_data.append(data)
+                continue
+            
             # default to score-sde preprocessing
             img = np.array(image).astype(np.uint8)
             image = Image.fromarray(img)
@@ -651,14 +690,14 @@ class TextualInversionDataset(Dataset):
             image = (image / 127.5 - 1.0).astype(np.float32)
             
             data["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
-            
-            # Convert images to latent space
-            latents = vae.encode(data["pixel_values"].to(self.device, dtype=self.weight_dtype).unsqueeze(0)).latent_dist.sample().detach().cpu().squeeze(0)
-            # latents = latents * vae.config.scaling_factor
-            latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor   # x_0
-            
+            with torch.no_grad():
+                # Convert images to latent space
+                latents = vae.encode(data["pixel_values"].to(self.device, dtype=self.weight_dtype).unsqueeze(0)).latent_dist.sample().detach().cpu().squeeze(0)
+                # latents = latents * vae.config.scaling_factor
+                latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor   # x_0
             data["latents"] = latents
             cache_data.append(data) 
+            torch.save(latents, cache_tensor_path)
         del vae
         torch.cuda.empty_cache()
         return cache_data
@@ -707,27 +746,26 @@ class TextualInversionDataset(Dataset):
             example = {**example, **(self.cache_data[i % self.num_images])}
             
             
-        example["input_ids_1"] = self.tokenizer_1(
-            text,
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_length=False,
-            return_overflowing_tokens=False,
-            return_tensors="pt",
-        ).input_ids[0]
-
-        example["input_ids_2"] = self.tokenizer_2(
-            text,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-            return_length=False,
-            return_overflowing_tokens=False,
-            return_tensors="pt",
-        ).input_ids[0]
-
+        example["input_ids_1"] = tokenize_prompt(
+            self.tokenizer_1, text, max_sequence_length=77
+        )[0]
+        example["input_ids_2"] = tokenize_prompt(
+            self.tokenizer_2, text, max_sequence_length=self.max_length
+        )[0]
         return example
+
+def tokenize_prompt(tokenizer, prompt, max_sequence_length):
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_length=False,
+        return_overflowing_tokens=False,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    return text_input_ids
 
 
 def _encode_prompt_with_t5(
@@ -744,20 +782,13 @@ def _encode_prompt_with_t5(
     batch_size = len(prompt)
 
     if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_length=False,
-            return_overflowing_tokens=False,
-            return_tensors="pt",
+        text_input_ids = tokenize_prompt(
+            tokenizer, prompt, max_sequence_length=max_sequence_length
         )
-        text_input_ids = text_inputs.input_ids
     else:
         if text_input_ids is None:
             raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
-        prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
 
     dtype = accelerator.unwrap_model(text_encoder).dtype
     prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
@@ -784,17 +815,9 @@ def _encode_prompt_with_clip(
     batch_size = len(prompt)
 
     if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_overflowing_tokens=False,
-            return_length=False,
-            return_tensors="pt",
+        text_input_ids = tokenize_prompt(
+            tokenizer, prompt, max_sequence_length=77
         )
-
-        text_input_ids = text_inputs.input_ids
     else:
         if text_input_ids is None:
             raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
@@ -870,7 +893,12 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-
+    
+    if accelerator.distributed_type == 'DEEPSPEED':
+        import deepspeed
+        # For debug
+        # deepspeed.ops.op_builder.CPUAdamBuilder().load()
+    
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
@@ -906,30 +934,26 @@ def main():
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
-
-    # Load tokenizer
-    tokenizer_1 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
-    tokenizer_2 = T5TokenizerFast.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
-
-    # Load scheduler and models
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    
+    # Model Init
+    model = FLUXModel(args)
+    tokenizer_1, tokenizer_2, noise_scheduler, text_encoder_1, text_encoder_2, vae, transformer = (model.tokenizer, model.tokenizer_2, model.scheduler, model.text_encoder, model.text_encoder_2, model.vae, model.transformer)
+    
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     
-    text_encoder_1 = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-    )
-    text_encoder_2 = T5EncoderModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
-    )
-    if not args.cache_latent:
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-        )
-    else:
-        vae = None
-    transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
-    )
+    vae, transformer = vae.to(dtype=weight_dtype) if vae is not None else None, transformer.to(dtype=weight_dtype)
+    
+    # NOT ALL parts of the model will be trained, below we just set `training=True` for Deepspeed
+    model.train()
+     
 
     # Add the placeholder token in tokenizer_1
     placeholder_tokens = [args.placeholder_token]
@@ -973,13 +997,14 @@ def main():
     if vae is not None:
         vae.requires_grad_(False)
     transformer.requires_grad_(False)
-    # text_encoder_2.requires_grad_(False)
+    
     # Freeze all parameters except for the token embeddings in text encoder
     text_encoder_1.text_model.encoder.requires_grad_(False)
     text_encoder_1.text_model.final_layer_norm.requires_grad_(False)
     text_encoder_1.text_model.embeddings.position_embedding.requires_grad_(False)
     
-    text_encoder_2.encoder.requires_grad_(False)
+    # text_encoder_2.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
     text_encoder_2.shared.requires_grad_(True)
 
     if args.gradient_checkpointing:
@@ -1030,13 +1055,6 @@ def main():
         eps=args.adam_epsilon,
     )
     
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     placeholder_token = " ".join(placeholder_tokens)
     # Dataset and DataLoaders creation:
@@ -1077,19 +1095,10 @@ def main():
         num_cycles=args.lr_num_cycles,
     )
 
-    text_encoder_1.train()
-    text_encoder_2.train()
-    text_encoder_1.to(dtype=weight_dtype)
-    text_encoder_2.to(dtype=weight_dtype)
     # Prepare everything with our `accelerator`.
-    text_encoder_1, text_encoder_2, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        text_encoder_1, text_encoder_2, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
-
-    # Move vae and unet and text_encoder_2 to device and cast to weight_dtype
-    transformer.to(accelerator.device, dtype=weight_dtype)
-    if vae is not None:
-        vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1152,11 +1161,16 @@ def main():
     )
 
     # keep original embeddings as reference
-    orig_embeds_params = [
-        accelerator.unwrap_model(text_encoder_1).get_input_embeddings().weight.data.clone(), 
-        accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight.data.clone()
-    ]
-    
+    if accelerator.distributed_type == 'DEEPSPEED':
+        orig_embeds_params = [
+            deepspeed.utils.safe_get_full_fp32_param(text_encoder_1.get_input_embeddings().weight).to(dtype=text_encoder_1.dtype).data.clone(),
+            deepspeed.utils.safe_get_full_fp32_param(text_encoder_2.get_input_embeddings().weight).to(dtype=text_encoder_1.dtype).data.clone(),
+        ]
+    else:
+        orig_embeds_params = [
+            text_encoder_1.get_input_embeddings().weight.data.clone(), 
+            text_encoder_2.get_input_embeddings().weight.data.clone()
+        ]
     
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
         sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
@@ -1171,6 +1185,7 @@ def main():
 
     for epoch in range(first_epoch, args.num_train_epochs):
         text_encoder_1.train()
+        text_encoder_2.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(text_encoder_1):
                 if args.cache_latent:
@@ -1237,23 +1252,23 @@ def main():
                             text_input_ids_list=[batch["input_ids_1"], batch["input_ids_2"]],
                             max_sequence_length=args.max_sequence_length,
                             prompt=batch["prompts"],
-                            accelerator=accelerator
-                        )
+                            accelerator=accelerator,
+                            device=accelerator.device,
+                )
                 
                 # Predict the noise residual
                 if args.gradient_checkpointing:
-                    model_pred = torch.utils.checkpoint.checkpoint(transformer,
-                        packed_noisy_latents.to(dtype=weight_dtype),
-                        prompt_embeds.to(dtype=weight_dtype),
-                        pooled_prompt_embeds.to(dtype=weight_dtype),
-                        timesteps / 1000,
-                        latent_image_ids,
-                        text_ids,
-                        guidance,
-                        None,
-                        False,
-                        use_reentrant=True
-                        )[0]
+                    model_pred = transformer(
+                        hidden_states=packed_noisy_latents.to(dtype=weight_dtype),
+                        # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
+                        timestep=timesteps / 1000,
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds.to(dtype=weight_dtype),
+                        encoder_hidden_states=prompt_embeds.to(dtype=weight_dtype),
+                        txt_ids=text_ids,
+                        img_ids=latent_image_ids,
+                        return_dict=False
+                    )[0]
                 else:
                     model_pred = transformer(
                         hidden_states=packed_noisy_latents.to(dtype=weight_dtype),
@@ -1318,12 +1333,20 @@ def main():
                 for orig_embeds_index, (tokenizer, text_encoder) in enumerate(zip([tokenizer_1, tokenizer_2], [text_encoder_1, text_encoder_2])):
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     index_no_updates = torch.ones((len(tokenizer),), dtype=torch.bool)
+                    placeholder_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
+                    
                     index_no_updates[min(placeholder_token_ids) : max(placeholder_token_ids) + 1] = False
 
                     with torch.no_grad():
-                        accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                            index_no_updates
-                        ] = orig_embeds_params[orig_embeds_index][index_no_updates]
+                        if accelerator.distributed_type == 'DEEPSPEED':
+                            current_weight = deepspeed.utils.safe_get_full_fp32_param(text_encoder.get_input_embeddings().weight).clone()
+                            current_weight = current_weight.to(dtype=text_encoder.dtype)
+                            current_weight[index_no_updates] = orig_embeds_params[orig_embeds_index][index_no_updates]
+                            deepspeed.utils.safe_set_full_fp32_param(text_encoder.get_input_embeddings().weight, current_weight)
+                        else:
+                            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                                index_no_updates
+                            ] = orig_embeds_params[orig_embeds_index][index_no_updates]
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

@@ -20,9 +20,14 @@
 
 
 
-This repository contains some scripts that can be used to [Textual Inversion](https://github.com/rinongal/textual_inversion) in both Stable Diffusion 3 ([SD3](https://huggingface.co/stabilityai/stable-diffusion-3-medium)) and FLUX ([FLUX.1](https://huggingface.co/black-forest-labs/FLUX.1-dev)) models.
+This repository contains some scripts that can be used to [Textual Inversion](https://github.com/rinongal/textual_inversion) in both FLUX ([FLUX.1](https://huggingface.co/black-forest-labs/FLUX.1-dev)) and Stable Diffusion 3 ([SD3](https://huggingface.co/stabilityai/stable-diffusion-3-medium)) models.
 
-> This script need 40G+ VRAM to run, 24G version maybe released soon.
+> Updates:
+> **24.09.14**: Now we can use 24GB VRAM to train the FLUX.1 Textual Inversion model.
+
+## Introduction
+This script need 40G+ VRAM to **directly** train the FLUX.1 textual inversion model. 
+But now we support to train `FLUX.1 dev` model with ONLY **~22G** VRAM, any consumer grade graphics card with 24G VRAM can run this script.
 
 ## Install
 
@@ -37,7 +42,7 @@ cd textual-inversion-script
 pip install diffusers[torch] transformers[sentencepiece] 
 ```
 
-## Usage
+## Basic Usage
 
 We reference the [Diffuser script](https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion_sdxl.py), so all the arguments are the same, you can read [this](https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/README_sdxl.md).
 
@@ -45,7 +50,7 @@ We reference the [Diffuser script](https://github.com/huggingface/diffusers/blob
 export DATA_DIR="./cat"
 
 accelerate launch textual_inversion_flux.py \
-  --pretrained_model_name_or_path="black-forest-labs/FLUX.1-schnell" \
+  --pretrained_model_name_or_path="black-forest-labs/FLUX.1-dev" \
   --train_data_dir=$DATA_DIR \
   --learnable_property="object" \
   --placeholder_token="<cat-toy>" \
@@ -65,3 +70,29 @@ accelerate launch textual_inversion_flux.py \
   --cache_latent
 ```
 
+## Low VRAM Usage
+As the FLUX.1 model is too large to fit in a single GPU with 24G VRAM, so we can use `deepspeed` to train the model with only 22G VRAM.
+
+We have write a cofigure file `accelerate_config/deepspeed_zero3_offload_config.yaml` to help you train the model within 24G VRAM, below is the usage:
+
+```bash
+accelerate launch --config_file "accelerate_config/deepspeed_zero3_offload_config.yaml"  textual_inversion_flux.py \
+  --pretrained_model_name_or_path="black-forest-labs/FLUX.1-dev" \
+  --train_data_dir=$DATA_DIR \
+  --learnable_property="object" \
+  --placeholder_token="<cat-toy>" \
+  --initializer_token="toy" \
+  --mixed_precision="bf16" \
+  --resolution=1024 \
+  --train_batch_size=1 \
+  --gradient_accumulation_steps=4 \
+  --max_train_steps=500 \
+  --learning_rate=5.0e-04 \
+  --scale_lr \
+  --lr_scheduler="constant" \
+  --lr_warmup_steps=0 \
+  --save_as_full_pipeline \
+  --output_dir="./logs" \
+  --gradient_checkpointing \
+  --cache_latent
+```
