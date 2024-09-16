@@ -61,7 +61,8 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
-
+from transformers.integrations import is_deepspeed_zero3_enabled
+import deepspeed
 
 if is_wandb_available():
     import wandb
@@ -196,22 +197,19 @@ def log_validation(
     return images
 
 
-def save_progress(text_encoder, text_encoder_2, placeholder_token_ids, accelerator, args, save_path, safe_serialization=True):
+def save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_path, safe_serialization=True):
     logger.info("Saving embeddings")
-    learned_embeds = (
-        accelerator.unwrap_model(text_encoder)
-        .get_input_embeddings()
-        .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
-    )
-    learned_embeds_2 = (
-        accelerator.unwrap_model(text_encoder_2)
-        .get_input_embeddings()
-        .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
-    )
-    learned_embeds_dict = {
-        0: {args.placeholder_token: learned_embeds.detach().cpu()},
-        1: {args.placeholder_token: learned_embeds_2.detach().cpu()}
-    }
+    if is_deepspeed_zero3_enabled():
+        with deepspeed.zero.GatheredParameters(text_encoder.get_input_embeddings().weight, modifier_rank=0):
+            learned_embeds = text_encoder.get_input_embeddings().weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
+    else:
+        learned_embeds = (
+            accelerator.unwrap_model(text_encoder)
+            .get_input_embeddings()
+            .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
+        )
+        
+    learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
 
     if safe_serialization:
         safetensors.torch.save_file(learned_embeds_dict, save_path, metadata={"format": "pt"})
@@ -584,8 +582,6 @@ class FLUXModel(torch.nn.Module):
             args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
         )
         pass
-        # deepspeed.zero.register_external_parameter(self, self.text_encoder.get_input_embeddings().weight)
-        # deepspeed.zero.register_external_parameter(self, self.text_encoder_2.get_input_embeddings().weight)
 
 class TextualInversionDataset(Dataset):
     def __init__(
@@ -639,7 +635,13 @@ class TextualInversionDataset(Dataset):
         self.templates = imagenet_style_templates_small if learnable_property == "style" else imagenet_templates_small
         self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
         self.crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        
+        self.train_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
         if self.cache_latents:
             self.vae_config = {}
             self.cache_data = self.get_cache_latents(args)
@@ -649,7 +651,7 @@ class TextualInversionDataset(Dataset):
     def get_cache_latents(self, args):
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-        ).to(self.device, dtype=self.weight_dtype)
+        ).to(self.device)
         # NOT A GOOD WAY
         self.vae_config = copy.deepcopy(vae.config)
         
@@ -682,22 +684,20 @@ class TextualInversionDataset(Dataset):
                 cache_data.append(data)
                 continue
             
-            # default to score-sde preprocessing
-            img = np.array(image).astype(np.uint8)
-            image = Image.fromarray(img)
-            image = self.flip_transform(image)
-            image = np.array(image).astype(np.uint8)
-            image = (image / 127.5 - 1.0).astype(np.float32)
+            if self.flip_p > 0.0 and random.random() < self.flip_p:
+                image = self.flip_transform(image)
+            image = self.train_transforms(image)
+            data["pixel_values"] = image
             
-            data["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
             with torch.no_grad():
                 # Convert images to latent space
-                latents = vae.encode(data["pixel_values"].to(self.device, dtype=self.weight_dtype).unsqueeze(0)).latent_dist.sample().detach().cpu().squeeze(0)
-                # latents = latents * vae.config.scaling_factor
+                latents = vae.encode(data["pixel_values"].to(self.device).unsqueeze(0)).latent_dist.sample()
                 latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor   # x_0
+                latents = latents.cpu().squeeze(0)
             data["latents"] = latents
             cache_data.append(data) 
             torch.save(latents, cache_tensor_path)
+            del data["pixel_values"]
         del vae
         torch.cuda.empty_cache()
         return cache_data
@@ -894,11 +894,6 @@ def main():
         project_config=accelerator_project_config,
     )
     
-    if accelerator.distributed_type == 'DEEPSPEED':
-        import deepspeed
-        # For debug
-        # deepspeed.ops.op_builder.CPUAdamBuilder().load()
-    
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
@@ -1001,7 +996,9 @@ def main():
     # Freeze all parameters except for the token embeddings in text encoder
     text_encoder_1.text_model.encoder.requires_grad_(False)
     text_encoder_1.text_model.final_layer_norm.requires_grad_(False)
+    text_encoder_1.text_model.embeddings.requires_grad_(True)
     text_encoder_1.text_model.embeddings.position_embedding.requires_grad_(False)
+    
     
     # text_encoder_2.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
@@ -1048,7 +1045,10 @@ def main():
         optimizer_class = torch.optim.AdamW
 
     optimizer = optimizer_class(
-        list(text_encoder_1.get_input_embeddings().parameters()) + list(text_encoder_2.get_input_embeddings().parameters()),  # only optimize the embeddings
+        [
+            text_encoder_1.get_input_embeddings().weight,
+            text_encoder_2.get_input_embeddings().weight
+        ],
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -1160,14 +1160,11 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    orig_embeds_params = []
+    
     # keep original embeddings as reference
-    if accelerator.distributed_type == 'DEEPSPEED':
-        orig_embeds_params = [
-            deepspeed.utils.safe_get_full_fp32_param(text_encoder_1.get_input_embeddings().weight).to(dtype=text_encoder_1.dtype).data.clone(),
-            deepspeed.utils.safe_get_full_fp32_param(text_encoder_2.get_input_embeddings().weight).to(dtype=text_encoder_1.dtype).data.clone(),
-        ]
-    else:
-        orig_embeds_params = [
+    with deepspeed.zero.GatheredParameters([text_encoder_1.get_input_embeddings().weight, text_encoder_2.get_input_embeddings().weight], modifier_rank=None, enabled=is_deepspeed_zero3_enabled()):
+         orig_embeds_params = [
             text_encoder_1.get_input_embeddings().weight.data.clone(), 
             text_encoder_2.get_input_embeddings().weight.data.clone()
         ]
@@ -1187,9 +1184,9 @@ def main():
         text_encoder_1.train()
         text_encoder_2.train()
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(text_encoder_1):
+            with accelerator.accumulate(model):
                 if args.cache_latent:
-                    latents  = batch["latents"].to(device=accelerator.device)
+                    latents  = batch["latents"].to(device=accelerator.device, dtype=weight_dtype)
                     
                     vae_scale_factor = 2 ** (len(vae_config.block_out_channels))
                 else:
@@ -1330,6 +1327,9 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
                 for orig_embeds_index, (tokenizer, text_encoder) in enumerate(zip([tokenizer_1, tokenizer_2], [text_encoder_1, text_encoder_2])):
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     index_no_updates = torch.ones((len(tokenizer),), dtype=torch.bool)
@@ -1338,31 +1338,29 @@ def main():
                     index_no_updates[min(placeholder_token_ids) : max(placeholder_token_ids) + 1] = False
 
                     with torch.no_grad():
-                        if accelerator.distributed_type == 'DEEPSPEED':
-                            current_weight = deepspeed.utils.safe_get_full_fp32_param(text_encoder.get_input_embeddings().weight).clone()
-                            current_weight = current_weight.to(dtype=text_encoder.dtype)
-                            current_weight[index_no_updates] = orig_embeds_params[orig_embeds_index][index_no_updates]
-                            deepspeed.utils.safe_set_full_fp32_param(text_encoder.get_input_embeddings().weight, current_weight)
-                        else:
-                            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                        with deepspeed.zero.GatheredParameters(text_encoder.get_input_embeddings().weight, modifier_rank=0, enabled=is_deepspeed_zero3_enabled()):
+                            text_encoder.get_input_embeddings().weight[
                                 index_no_updates
                             ] = orig_embeds_params[orig_embeds_index][index_no_updates]
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
+                
                 images = []
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.save_steps == 0:
-                    weight_name = f"learned_embeds-steps-{global_step}.safetensors"
-                    save_path = os.path.join(args.output_dir, weight_name)
                     save_progress(
                         text_encoder_1,
-                        text_encoder_2,
-                        placeholder_token_ids,
+                        tokenizer_1.convert_tokens_to_ids(placeholder_tokens),
                         accelerator,
                         args,
-                        save_path,
+                        save_path=os.path.join(args.output_dir, f"learned_embeds-steps-{global_step}.safetensors"),
+                        safe_serialization=True,
+                    )
+                    save_progress(
+                        text_encoder_2,
+                        tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
+                        accelerator,
+                        args,
+                        save_path=os.path.join(args.output_dir, f"learned_embeds_2-steps-{global_step}.safetensors"),
                         safe_serialization=True,
                     )
 
@@ -1457,16 +1455,22 @@ def main():
             pipeline.save_pretrained(args.output_dir)
             if args.cache_latent:
                 del vae
+        
         # Save the newly trained embeddings
-        weight_name = "learned_embeds.safetensors"
-        save_path = os.path.join(args.output_dir, weight_name)
         save_progress(
             text_encoder_1,
-            text_encoder_2,
-            placeholder_token_ids,
+            tokenizer_1.convert_tokens_to_ids(placeholder_tokens),
             accelerator,
             args,
-            save_path,
+            save_path=os.path.join(args.output_dir, "learned_embeds.safetensors"),
+            safe_serialization=True,
+        )
+        save_progress(
+            text_encoder_2,
+            tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
+            accelerator,
+            args,
+            save_path=os.path.join(args.output_dir, "learned_embeds_2.safetensors"),
             safe_serialization=True,
         )
 
