@@ -70,6 +70,11 @@ accelerate launch textual_inversion_flux.py \
   --cache_latent
 ```
 
+
+### Train T5
+
+As FLUX has two text encoder, default we only train the `clip` encoder, if you want to train the `t5` encoder, you can use the `--train_text_encoder_2` argument.
+
 ## Low VRAM Usage
 As the FLUX.1 model is too large to fit in a single GPU with 24G VRAM, so we can use `deepspeed` to train the model with only 22G VRAM.
 

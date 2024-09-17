@@ -237,6 +237,11 @@ def parse_args():
         help="Save the complete FLUX pipeline.",
     )
     parser.add_argument(
+        "--train_text_encoder_2",
+        action="store_true",
+        help="Whether to train the text encoder 2.",
+    )
+    parser.add_argument(
         "--num_vectors",
         type=int,
         default=1,
@@ -961,8 +966,10 @@ def main():
     for i in range(1, args.num_vectors):
         additional_tokens.append(f"{args.placeholder_token}_{i}")
     placeholder_tokens += additional_tokens
+    
+    zip_tokenizer_text_encoder = zip([tokenizer_1, tokenizer_2], [text_encoder_1, text_encoder_2]) if args.train_text_encoder_2 else [(tokenizer_1, text_encoder_1)]
 
-    for tokenizer, text_encoder in zip([tokenizer_1, tokenizer_2], [text_encoder_1, text_encoder_2]):        
+    for tokenizer, text_encoder in zip_tokenizer_text_encoder:        
         num_added_tokens = tokenizer.add_tokens(placeholder_tokens)
         if num_added_tokens != args.num_vectors:
             raise ValueError(
@@ -999,10 +1006,11 @@ def main():
     text_encoder_1.text_model.embeddings.requires_grad_(True)
     text_encoder_1.text_model.embeddings.position_embedding.requires_grad_(False)
     
-    
-    # text_encoder_2.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
-    text_encoder_2.shared.requires_grad_(True)
+    if args.train_text_encoder_2:
+        text_encoder_2.requires_grad_(False)
+        text_encoder_2.shared.requires_grad_(True)
+    else:
+        text_encoder_2.requires_grad_(False)
 
     if args.gradient_checkpointing:
         text_encoder_1.gradient_checkpointing_enable()
@@ -1044,17 +1052,20 @@ def main():
     else:
         optimizer_class = torch.optim.AdamW
 
+    trainable_params = [
+        text_encoder_1.get_input_embeddings().weight,
+    ] + ([text_encoder_2.get_input_embeddings().weight] if args.train_text_encoder_2 else [])
+    
     optimizer = optimizer_class(
-        [
-            text_encoder_1.get_input_embeddings().weight,
-            text_encoder_2.get_input_embeddings().weight
-        ],
+        model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    logger.info(f"  Total trainable parameters = {sum(p.numel() / 1_000_000 for p in model.parameters() if p.requires_grad):.2f}M, {sum(p.numel() / 1_000_000 for p in trainable_params):.2f}M")
     
+    assert sum(p.numel() / 1_000_000 for p in model.parameters() if p.requires_grad) == sum(p.numel() / 1_000_000 for p in trainable_params), "Mismatch in trainable parameters"
 
     placeholder_token = " ".join(placeholder_tokens)
     # Dataset and DataLoaders creation:
@@ -1122,6 +1133,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    
     global_step = 0
     first_epoch = 0
     # Potentially load in the weights and states from a previous save
@@ -1163,10 +1175,10 @@ def main():
     orig_embeds_params = []
     
     # keep original embeddings as reference
-    with deepspeed.zero.GatheredParameters([text_encoder_1.get_input_embeddings().weight, text_encoder_2.get_input_embeddings().weight], modifier_rank=None, enabled=is_deepspeed_zero3_enabled()):
+    with deepspeed.zero.GatheredParameters(trainable_params, modifier_rank=None, enabled=is_deepspeed_zero3_enabled()):
          orig_embeds_params = [
-            text_encoder_1.get_input_embeddings().weight.data.clone(), 
-            text_encoder_2.get_input_embeddings().weight.data.clone()
+            weight.data.clone()
+            for weight in trainable_params
         ]
     
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
@@ -1182,11 +1194,12 @@ def main():
 
     for epoch in range(first_epoch, args.num_train_epochs):
         text_encoder_1.train()
-        text_encoder_2.train()
+        if args.train_text_encoder_2:
+            text_encoder_2.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 if args.cache_latent:
-                    latents  = batch["latents"].to(device=accelerator.device, dtype=weight_dtype)
+                    latents = batch["latents"].to(device=accelerator.device, dtype=weight_dtype)
                     
                     vae_scale_factor = 2 ** (len(vae_config.block_out_channels))
                 else:
@@ -1330,7 +1343,7 @@ def main():
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                for orig_embeds_index, (tokenizer, text_encoder) in enumerate(zip([tokenizer_1, tokenizer_2], [text_encoder_1, text_encoder_2])):
+                for orig_embeds_index, (tokenizer, text_encoder) in enumerate(zip_tokenizer_text_encoder):
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     index_no_updates = torch.ones((len(tokenizer),), dtype=torch.bool)
                     placeholder_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
@@ -1355,14 +1368,15 @@ def main():
                         save_path=os.path.join(args.output_dir, f"learned_embeds-steps-{global_step}.safetensors"),
                         safe_serialization=True,
                     )
-                    save_progress(
-                        text_encoder_2,
-                        tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
-                        accelerator,
-                        args,
-                        save_path=os.path.join(args.output_dir, f"learned_embeds_2-steps-{global_step}.safetensors"),
-                        safe_serialization=True,
-                    )
+                    if args.train_text_encoder_2:
+                        save_progress(
+                            text_encoder_2,
+                            tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
+                            accelerator,
+                            args,
+                            save_path=os.path.join(args.output_dir, f"learned_embeds_2-steps-{global_step}.safetensors"),
+                            safe_serialization=True,
+                        )
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -1465,14 +1479,15 @@ def main():
             save_path=os.path.join(args.output_dir, "learned_embeds.safetensors"),
             safe_serialization=True,
         )
-        save_progress(
-            text_encoder_2,
-            tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
-            accelerator,
-            args,
-            save_path=os.path.join(args.output_dir, "learned_embeds_2.safetensors"),
-            safe_serialization=True,
-        )
+        if args.train_text_encoder_2:
+            save_progress(
+                text_encoder_2,
+                tokenizer_2.convert_tokens_to_ids(placeholder_tokens),
+                accelerator,
+                args,
+                save_path=os.path.join(args.output_dir, "learned_embeds_2.safetensors"),
+                safe_serialization=True,
+            )
 
         if args.push_to_hub:
             save_model_card(
